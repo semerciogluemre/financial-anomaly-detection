@@ -1,0 +1,9 @@
+torch
+scikit-learn
+pandas
+numpy
+sqlalchemy
+shap
+streamlit
+plotly
+mlflow
