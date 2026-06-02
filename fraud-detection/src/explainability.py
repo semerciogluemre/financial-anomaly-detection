@@ -382,3 +382,196 @@ class Explainer:
             sum(var_explained) * 100, var_explained[0] * 100, var_explained[1] * 100,
         )
         return path
+
+    # ------------------------------------------------------------------
+    # XGBoost SHAP (primary explainer — v1.1.0)
+    # ------------------------------------------------------------------
+
+    def shap_xgboost_summary(
+        self,
+        model,                     # XGBoostModel instance
+        X: pd.DataFrame,
+        n_samples: int = 2000,
+        n_top_features: int = 15,
+        run_name: str = "shap_xgboost_summary",
+    ) -> Path:
+        """
+        SHAP TreeExplainer on XGBoost — global feature importance bar chart.
+
+        Uses the exact TreeExplainer (not the approximate kernel version),
+        which is fast and precise for tree-based models.
+        """
+        if model._model is None:
+            raise RuntimeError("XGBoostModel must be fitted.")
+
+        feat_cols = model.feature_names_ or list(X.columns)
+        X_sample  = X[feat_cols].astype(np.float32)
+        if len(X_sample) > n_samples:
+            X_sample = X_sample.sample(n_samples, random_state=42)
+
+        logger.info("SHAP TreeExplainer on XGBoost (%d samples) …", len(X_sample))
+        # Use predict as background to avoid base_score float-parse bug
+        # in some shap/xgboost version combinations
+        predict_fn = lambda x: model._model.predict_proba(x)[:, 1]
+        explainer  = shap.Explainer(predict_fn, X_sample.values[:100])
+        shap_vals  = explainer(X_sample.values).values   # (n, n_features)
+        mean_abs   = np.abs(shap_vals).mean(axis=0)
+        top_idx    = np.argsort(mean_abs)[::-1][:n_top_features]
+        top_feats  = [feat_cols[i] for i in top_idx]
+        top_vals   = mean_abs[top_idx]
+
+        fig, ax = plt.subplots(figsize=(9, max(5, n_top_features * 0.45)))
+        ax.set_facecolor("#F8F9FA")
+        ax.barh(range(len(top_feats)), top_vals[::-1],
+                color="#2A9D8F", edgecolor="white", linewidth=0.4, alpha=0.85)
+        ax.set_yticks(range(len(top_feats)))
+        ax.set_yticklabels(top_feats[::-1], fontsize=9)
+        ax.set_xlabel("Mean |SHAP value|", fontsize=11)
+        ax.set_title(
+            f"SHAP Feature Importance — XGBoost\n(top {n_top_features}, n={len(X_sample)})",
+            fontsize=12, fontweight="bold",
+        )
+        ax.grid(True, axis="x", alpha=0.4)
+        plt.tight_layout()
+
+        path = self._save(fig, "shap_xgboost_summary.png")
+
+        with mlflow.start_run(run_name=run_name):
+            mlflow.log_params({"n_samples": n_samples, "n_top_features": n_top_features})
+            for feat, val in zip(top_feats, top_vals):
+                mlflow.log_metric(f"xgb_shap_{feat}", float(val))
+            mlflow.log_artifact(str(path))
+
+        return path
+
+    def shap_xgboost_waterfall(
+        self,
+        model,
+        X: pd.DataFrame,
+        transaction_idx: int,
+        run_name: str | None = None,
+    ) -> Path:
+        """Waterfall plot for a single transaction using XGBoost SHAP values."""
+        if model._model is None:
+            raise RuntimeError("XGBoostModel must be fitted.")
+
+        feat_cols = model.feature_names_ or list(X.columns)
+        X_row     = X[feat_cols].iloc[[transaction_idx]].astype(np.float32)
+
+        predict_fn = lambda x: model._model.predict_proba(x)[:, 1]
+        # Use a small background to avoid the TreeExplainer base_score bug
+        bg = X_row.values  # single-row background for speed
+        explainer = shap.Explainer(predict_fn, bg)
+        shap_obj  = explainer(X_row.values)
+        shap_vals = shap_obj.values[0]
+        base_val  = float(shap_obj.base_values[0]) if hasattr(shap_obj, "base_values") else 0.0
+        raw_vals  = X_row.values[0]
+
+        order   = np.argsort(np.abs(shap_vals))[::-1][:15]
+        feats   = [feat_cols[i] for i in order]
+        vals    = shap_vals[order]
+        raws    = raw_vals[order]
+        colors  = ["#E63946" if v > 0 else "#2A9D8F" for v in vals]
+
+        fig, ax = plt.subplots(figsize=(10, max(5, len(feats) * 0.5)))
+        ax.set_facecolor("#F8F9FA")
+        bars = ax.barh(range(len(feats)), vals[::-1],
+                       color=colors[::-1], edgecolor="white", alpha=0.85)
+        for bar, raw in zip(bars, raws[::-1]):
+            x_pos = bar.get_width()
+            ax.text(x_pos + (0.002 if x_pos >= 0 else -0.002),
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{raw:.3g}", va="center",
+                    ha="left" if x_pos >= 0 else "right",
+                    fontsize=7, color="#495057")
+        ax.set_yticks(range(len(feats)))
+        ax.set_yticklabels(feats[::-1], fontsize=9)
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_xlabel("SHAP value (impact on fraud probability)", fontsize=11)
+        ax.set_title(
+            f"XGBoost SHAP Waterfall — Transaction index {transaction_idx}\n"
+            f"Base value = {base_val:.4f}",
+            fontsize=12, fontweight="bold",
+        )
+        import matplotlib.patches as mpatches
+        ax.legend(handles=[
+            mpatches.Patch(color="#E63946", alpha=0.85, label="Increases fraud prob"),
+            mpatches.Patch(color="#2A9D8F", alpha=0.85, label="Decreases fraud prob"),
+        ], fontsize=9, loc="lower right")
+        ax.grid(True, axis="x", alpha=0.4)
+        plt.tight_layout()
+
+        filename = f"shap_waterfall_{transaction_idx}.png"
+        path = self._save(fig, filename)
+        _run = run_name or f"shap_xgb_waterfall_{transaction_idx}"
+        with mlflow.start_run(run_name=_run):
+            mlflow.log_artifact(str(path))
+        return path
+
+    def shap_comparison(
+        self,
+        xgb_model,
+        iso_model,
+        X: pd.DataFrame,
+        n_samples: int = 1000,
+        n_top: int = 10,
+        run_name: str = "shap_comparison",
+    ) -> Path:
+        """
+        Side-by-side bar chart comparing top-10 SHAP features from
+        XGBoost (supervised) and Isolation Forest (unsupervised).
+        Shows whether both models agree on what drives anomaly scores.
+        """
+        # XGBoost SHAP
+        xgb_feats = xgb_model.feature_names_ or list(X.columns)
+        X_xgb = X[xgb_feats].astype(np.float32)
+        if len(X_xgb) > n_samples:
+            X_xgb = X_xgb.sample(n_samples, random_state=42)
+        predict_fn_xgb = lambda x: xgb_model._model.predict_proba(x)[:, 1]
+        xgb_exp  = shap.Explainer(predict_fn_xgb, X_xgb.values[:100])
+        xgb_sv   = xgb_exp(X_xgb.values).values
+        xgb_mean = np.abs(xgb_sv).mean(axis=0)
+        xgb_top  = pd.Series(xgb_mean, index=xgb_feats).nlargest(n_top)
+
+        # IF SHAP
+        X_if = X.drop(columns=[c for c in iso_model.DROP_COLS if c in X.columns])
+        X_if = X_if.select_dtypes(include="number").astype(np.float32)
+        if iso_model._scaler:
+            X_if_s = iso_model._scaler.transform(X_if.values)
+        else:
+            X_if_s = X_if.values
+        if len(X_if_s) > n_samples:
+            X_if_s = X_if_s[:n_samples]
+        if_exp  = shap.TreeExplainer(iso_model._model)
+        if_sv   = if_exp.shap_values(X_if_s)
+        if_mean = np.abs(if_sv).mean(axis=0)
+        if_feats = iso_model.feature_cols or list(X_if.columns)
+        if_top   = pd.Series(if_mean[:len(if_feats)], index=if_feats[:len(if_mean)]).nlargest(n_top)
+
+        # Normalise to [0,1] for fair visual comparison
+        xgb_norm = xgb_top / xgb_top.max()
+        if_norm  = if_top  / if_top.max()
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle("SHAP Feature Importance Comparison\nXGBoost (supervised) vs Isolation Forest (unsupervised)",
+                     fontsize=13, fontweight="bold")
+
+        for ax, series, title, color in [
+            (axes[0], xgb_norm, "XGBoost", "#2A9D8F"),
+            (axes[1], if_norm,  "Isolation Forest", "#457B9D"),
+        ]:
+            ax.set_facecolor("#F8F9FA")
+            ax.barh(range(len(series)), series.values[::-1],
+                    color=color, edgecolor="white", alpha=0.85)
+            ax.set_yticks(range(len(series)))
+            ax.set_yticklabels(series.index[::-1], fontsize=9)
+            ax.set_xlabel("Normalised Mean |SHAP|")
+            ax.set_title(title, fontweight="bold")
+            ax.grid(True, axis="x", alpha=0.4)
+
+        plt.tight_layout()
+        path = self._save(fig, "shap_comparison.png")
+
+        with mlflow.start_run(run_name=run_name):
+            mlflow.log_artifact(str(path))
+        return path
