@@ -54,6 +54,7 @@ class ModelTrainer:
             else:
                 device = "cpu"
         self.device = torch.device(device)
+        self._scaler = None   # fitted during first prepare_sequences call
         logger.info("ModelTrainer using device: %s", self.device)
 
     # ------------------------------------------------------------------
@@ -106,6 +107,20 @@ class ModelTrainer:
         cols = [c for c in self.feature_cols if c in data.columns]
         X = data[cols].astype(np.float32).values  # (N, n_features)
 
+        # Replace any residual NaN/Inf before scaling
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Standardise features — critical to prevent NaN loss in LSTM
+        # Fit scaler on this split; store it so score() can reuse it
+        if train_on_normal or self._scaler is None:
+            from sklearn.preprocessing import StandardScaler
+            self._scaler = StandardScaler()
+            X = self._scaler.fit_transform(X)
+            logger.info("StandardScaler fitted and applied.")
+        else:
+            X = self._scaler.transform(X)
+            logger.info("Existing StandardScaler applied.")
+
         # Sliding window
         sequences = np.stack(
             [X[i : i + seq_len] for i in range(len(X) - seq_len + 1)],
@@ -119,7 +134,9 @@ class ModelTrainer:
 
         tensor = torch.tensor(sequences, dtype=torch.float32)
         dataset = TensorDataset(tensor)
-        return DataLoader(dataset, batch_size=256, shuffle=True, pin_memory=True)
+        # pin_memory is unsupported on MPS; use it only for CUDA
+        pin = self.device.type == "cuda"
+        return DataLoader(dataset, batch_size=512, shuffle=True, pin_memory=pin)
 
     # ------------------------------------------------------------------
     # Training

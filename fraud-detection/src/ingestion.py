@@ -141,13 +141,18 @@ class DataIngestion:
                                 **self._build_c_m_columns(),
                                 **self._build_v_columns(339)}
 
+        def _resolve(col_type):
+            """Accept both type classes (Integer) and type instances (String(8))."""
+            import inspect
+            return col_type() if inspect.isclass(col_type) else col_type
+
         transaction_columns = [
-            Column(name, col_type(), primary_key=(name == "TransactionID"))
+            Column(name, _resolve(col_type), primary_key=(name == "TransactionID"))
             for name, col_type in transaction_col_defs.items()
         ]
 
         identity_columns = [
-            Column(name, col_type(), primary_key=(name == "TransactionID"))
+            Column(name, _resolve(col_type), primary_key=(name == "TransactionID"))
             for name, col_type in self.IDENTITY_COLS.items()
         ]
 

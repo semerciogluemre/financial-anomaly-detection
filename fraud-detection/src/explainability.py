@@ -221,7 +221,7 @@ class Explainer:
         ax.set_xlabel("SHAP value  (impact on anomaly score)", fontsize=11)
         ax.set_title(
             f"SHAP Waterfall — Transaction index {transaction_idx}\n"
-            f"Base value = {base_val:.4f}",
+            f"Base value = {float(np.atleast_1d(base_val)[0]):.4f}",
             fontsize=12, fontweight="bold",
         )
 

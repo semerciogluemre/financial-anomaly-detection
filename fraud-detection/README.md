@@ -178,9 +178,13 @@ The LSTM receives higher weight because it explicitly models temporal sequence s
 
 | Model | Precision | Recall | F1 | ROC-AUC | PR-AUC | FPR |
 |---|---|---|---|---|---|---|
-| LSTM Autoencoder | — | — | — | — | — | — |
-| Isolation Forest | — | — | — | — | — | — |
-| **Ensemble** | **—** | **—** | **—** | **—** | **—** | **—** |
+| LSTM Autoencoder | 0.0371 | 0.0529 | 0.0436 | 0.5010 | 0.0352 | 0.0499 |
+| Isolation Forest | 0.1793 | 0.2247 | 0.1995 | 0.7130 | 0.1224 | 0.0373 |
+| **Ensemble** | **0.1710** | **0.2373** | **0.1988** | **0.7129** | **0.1213** | **0.0417** |
+
+> Trained on the full IEEE-CIS training set (590,540 transactions · 3.5% fraud).
+> LSTM: `hidden_dim=64`, `latent_dim=32`, `seq_len=10`, 20 epochs, MPS device, final train loss 0.5199.
+> Isolation Forest: `n_estimators=200`, `contamination=0.035`. Ensemble: w_lstm=0.6, w_iso=0.4, threshold tuned to maximise F1.
 
 Results are also saved programmatically to `outputs/results_table.csv` by `src/evaluate.py` and logged to MLflow. Run `mlflow ui` in the project root to explore all tracked experiments.
 
@@ -203,7 +207,7 @@ Results are also saved programmatically to `outputs/results_table.csv` by `src/e
 *Top 15 features by mean absolute SHAP value. Identifies which engineered signals drive the Isolation Forest's anomaly scores.*
 
 ### SHAP Waterfall — Example Transaction
-![SHAP Waterfall](outputs/shap_waterfall_0.png)
+![SHAP Waterfall](outputs/shap_waterfall_10.png)
 *Local explanation for a single flagged transaction. Red bars push the score toward fraud; blue bars push toward normal. Raw feature values are annotated on each bar.*
 
 ### LSTM Latent Space (PCA 2D)

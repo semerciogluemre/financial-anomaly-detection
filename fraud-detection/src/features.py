@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 
@@ -146,6 +147,55 @@ class FeatureEngineer:
         logger.info("Building feature matrix from 07_combined_features.sql …")
         sql = self.load_sql("07_combined_features.sql")
         df = self.run_query(sql)
+
+        # ── Velocity features (computed in pandas — SQL self-join too slow) ──
+        logger.info("Computing velocity features in pandas …")
+        df = df.sort_values("TransactionDT").reset_index(drop=True)
+
+        txn_count_1h  = []
+        txn_count_24h = []
+        card_groups   = df.groupby("card1", sort=False)
+
+        # Pre-compute per-card numpy arrays for fast range counting
+        card_dt_map = {
+            card: grp["TransactionDT"].values
+            for card, grp in card_groups
+        }
+        card_idx_map = {
+            card: grp.index.values
+            for card, grp in card_groups
+        }
+
+        # Allocate output arrays
+        count_1h  = np.zeros(len(df), dtype=np.int32)
+        count_24h = np.zeros(len(df), dtype=np.int32)
+
+        for card, dts in card_dt_map.items():
+            idxs = card_idx_map[card]
+            for pos, (row_idx, dt) in enumerate(zip(idxs, dts)):
+                lo_1h  = np.searchsorted(dts, dt - 3600,  side="left")
+                lo_24h = np.searchsorted(dts, dt - 86400, side="left")
+                # exclude the transaction itself (pos)
+                count_1h[row_idx]  = pos - lo_1h
+                count_24h[row_idx] = pos - lo_24h
+
+        df["txn_count_1h"]  = count_1h
+        df["txn_count_24h"] = count_24h
+
+        # High-velocity flags: mean + 2σ per card
+        vel_stats = df.groupby("card1")[["txn_count_1h", "txn_count_24h"]].agg(["mean", "std"])
+        vel_stats.columns = ["mean_1h", "std_1h", "mean_24h", "std_24h"]
+        vel_stats["std_1h"]  = vel_stats["std_1h"].fillna(0)
+        vel_stats["std_24h"] = vel_stats["std_24h"].fillna(0)
+        df = df.merge(vel_stats, on="card1", how="left")
+        df["high_velocity_flag_1h"]  = (
+            df["txn_count_1h"]  > df["mean_1h"]  + 2 * df["std_1h"]
+        ).astype("Int8")
+        df["high_velocity_flag_24h"] = (
+            df["txn_count_24h"] > df["mean_24h"] + 2 * df["std_24h"]
+        ).astype("Int8")
+        df.drop(columns=["mean_1h", "std_1h", "mean_24h", "std_24h"], inplace=True)
+        logger.info("Velocity features added.")
 
         # ── Validate required columns ─────────────────────────────────
         missing = self.REQUIRED_COLS - set(df.columns)

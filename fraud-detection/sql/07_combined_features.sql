@@ -3,9 +3,12 @@
 -- Master feature matrix — joins all feature blocks into one row per transaction.
 -- This is the canonical query called by the Python FeatureEngineer pipeline.
 --
+-- NOTE: Velocity features (txn_count_1h / 24h) are computed in Python via
+-- pandas rolling windows (see FeatureEngineer.build_feature_matrix) because
+-- a self-join on 590k rows is prohibitively slow in SQLite.
+--
 -- Output columns (grouped by source):
 --   [base]       TransactionID, isFraud, TransactionAmt, ProductCD, card1-6
---   [velocity]   txn_count_1h, txn_count_24h, high_velocity_flag_1h/24h
 --   [amount]     amt_zscore, amt_anomaly_flag, amt_to_mean_ratio,
 --                card_amt_mean, card_amt_stddev
 --   [time]       hour_of_day, day_of_week, is_off_hours, is_weekend,
@@ -18,35 +21,7 @@
 
 WITH
 
--- ── 1. Velocity ──────────────────────────────────────────────────────────────
-velocity AS (
-    SELECT
-        t.TransactionID,
-        COUNT(prev.TransactionID)                               AS txn_count_1h,
-        SUM(CASE WHEN prev.TransactionDT >= t.TransactionDT - 86400
-                 THEN 1 ELSE 0 END)                             AS txn_count_24h
-    FROM fraud_combined t
-    LEFT JOIN fraud_combined prev
-           ON  prev.card1         = t.card1
-          AND  prev.TransactionID != t.TransactionID
-          AND  prev.TransactionDT >= t.TransactionDT - 3600
-          AND  prev.TransactionDT <  t.TransactionDT
-    GROUP BY t.TransactionID
-),
-
-velocity_stats AS (
-    SELECT
-        t.card1,
-        AVG(v.txn_count_1h)   AS avg_1h,
-        SQRT(MAX(AVG(v.txn_count_1h  * v.txn_count_1h)  - AVG(v.txn_count_1h)  * AVG(v.txn_count_1h),  0)) AS std_1h,
-        AVG(v.txn_count_24h)  AS avg_24h,
-        SQRT(MAX(AVG(v.txn_count_24h * v.txn_count_24h) - AVG(v.txn_count_24h) * AVG(v.txn_count_24h), 0)) AS std_24h
-    FROM fraud_combined t
-    JOIN velocity v ON t.TransactionID = v.TransactionID
-    GROUP BY t.card1
-),
-
--- ── 2. Amount stats ──────────────────────────────────────────────────────────
+-- ── 1. Amount stats ──────────────────────────────────────────────────────────
 card_stats AS (
     SELECT
         card1,
@@ -59,7 +34,7 @@ card_stats AS (
     GROUP BY card1
 ),
 
--- ── 3. Time features ─────────────────────────────────────────────────────────
+-- ── 2. Time features ─────────────────────────────────────────────────────────
 time_base AS (
     SELECT
         TransactionID,
@@ -79,7 +54,7 @@ hour_agg AS (
     GROUP BY hour_of_day
 ),
 
--- ── 4. Device risk ───────────────────────────────────────────────────────────
+-- ── 3. Device risk ───────────────────────────────────────────────────────────
 device_combo AS (
     SELECT
         DeviceType, DeviceInfo,
@@ -100,7 +75,7 @@ device_type AS (
     GROUP BY DeviceType
 ),
 
--- ── 5. Address mismatch ──────────────────────────────────────────────────────
+-- ── 4. Address mismatch ──────────────────────────────────────────────────────
 addr_stats AS (
     SELECT
         card1,
@@ -111,7 +86,7 @@ addr_stats AS (
     GROUP BY card1
 ),
 
--- ── 6. Email domain risk ─────────────────────────────────────────────────────
+-- ── 5. Email domain risk ─────────────────────────────────────────────────────
 global_rate AS (
     SELECT AVG(COALESCE(isFraud, 0)) AS g FROM fraud_combined
 ),
@@ -146,12 +121,6 @@ SELECT
     fc.card5,
     fc.card6,
     fc.TransactionDT,
-
-    -- Velocity
-    v.txn_count_1h,
-    v.txn_count_24h,
-    CASE WHEN v.txn_count_1h  > vs.avg_1h  + 2 * vs.std_1h  THEN 1 ELSE 0 END AS high_velocity_flag_1h,
-    CASE WHEN v.txn_count_24h > vs.avg_24h + 2 * vs.std_24h THEN 1 ELSE 0 END AS high_velocity_flag_24h,
 
     -- Amount
     CASE WHEN cs.amt_stddev > 0
@@ -204,8 +173,6 @@ SELECT
 
 FROM fraud_combined fc
 CROSS JOIN global_rate gr
-LEFT JOIN velocity        v   ON fc.TransactionID  = v.TransactionID
-LEFT JOIN velocity_stats  vs  ON fc.card1          = vs.card1
 LEFT JOIN card_stats      cs  ON fc.card1          = cs.card1
 LEFT JOIN time_base       tb  ON fc.TransactionID  = tb.TransactionID
 LEFT JOIN hour_agg        ha  ON tb.hour_of_day    = ha.hour_of_day
