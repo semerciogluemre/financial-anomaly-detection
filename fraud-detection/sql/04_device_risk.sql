@@ -4,9 +4,13 @@
 -- Computes historical fraud rate per (DeviceType, DeviceInfo) pair and
 -- per DeviceType alone (coarser fallback). Joins back to each transaction.
 --
--- device_combo_fraud_rate : fraud rate for exact DeviceType+DeviceInfo combo
--- device_type_fraud_rate  : fraud rate for DeviceType only (coarser)
--- device_risk_score       : combo rate when available, else type rate
+-- NOTE ON LEAKAGE: In offline evaluation on a single dataset, these aggregates
+-- include the target transaction itself (minor self-inclusion leakage).
+-- In production, stats are computed on the training split only and applied to
+-- the test split — handled in the Python pipeline via train/test split before
+-- fitting any model. See src/run_pipeline.py for the correct split logic.
+--
+-- device_risk_score : combo rate if combo seen >= 5 times, else type rate
 -- =============================================================================
 
 WITH device_combo_stats AS (
@@ -40,28 +44,23 @@ SELECT
     fc.DeviceType,
     fc.DeviceInfo,
 
-    -- Combo-level stats
     dcs.combo_txn_count,
     dcs.combo_fraud_rate,
 
-    -- Type-level stats (fallback)
     dts.type_txn_count,
     dts.type_fraud_rate,
 
-    -- Best available risk score: use combo if seen ≥ 5 times, else type
     CASE
         WHEN dcs.combo_txn_count >= 5 THEN dcs.combo_fraud_rate
         WHEN dts.type_txn_count  >= 1 THEN dts.type_fraud_rate
         ELSE NULL
     END                                 AS device_risk_score,
 
-    -- High-risk device flag (risk score > 0.1)
     CASE
         WHEN COALESCE(dcs.combo_fraud_rate, dts.type_fraud_rate, 0) > 0.1
         THEN 1 ELSE 0
     END                                 AS high_risk_device_flag,
 
-    -- Unknown device flag (not seen in training)
     CASE WHEN dcs.combo_txn_count IS NULL THEN 1 ELSE 0 END
                                         AS unknown_device_flag
 

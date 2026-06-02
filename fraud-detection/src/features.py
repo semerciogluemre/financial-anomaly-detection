@@ -224,10 +224,91 @@ class FeatureEngineer:
         for col in obj_cols:
             df[col] = df[col].astype("category").cat.codes.astype("int16")
 
+        # ── Drop zero-variance features ───────────────────────────────
+        feat_cols = [c for c in df.columns if c not in self.NON_FEATURE_COLS]
+        numeric_df = df[feat_cols].select_dtypes(include="number")
+        zv_cols = numeric_df.columns[numeric_df.std() == 0].tolist()
+        if zv_cols:
+            df.drop(columns=zv_cols, inplace=True)
+            logger.info("Dropped %d zero-variance feature(s): %s", len(zv_cols), zv_cols)
+
+        # ── Convert Int8/nullable to float32 for sklearn compatibility ─
+        int8_cols = df.select_dtypes(include="Int8").columns.tolist()
+        for col in int8_cols:
+            df[col] = df[col].astype("float32")
+
+        # ── Integrity assertion ───────────────────────────────────────
+        feat_cols_final = [c for c in df.columns if c not in self.NON_FEATURE_COLS]
+        float_vals = df[feat_cols_final].select_dtypes(include="number").values
+        nan_remaining = np.isnan(float_vals).sum()
+        inf_remaining = np.isinf(float_vals).sum()
+        if nan_remaining > 0:
+            logger.warning("⚠️  %d NaN values remain after preprocessing — imputing with 0", nan_remaining)
+            df[feat_cols_final] = df[feat_cols_final].fillna(0)
+        if inf_remaining > 0:
+            logger.warning("⚠️  %d Inf values found — clipping to finite range", inf_remaining)
+            df[feat_cols_final] = df[feat_cols_final].replace([np.inf, -np.inf], 0)
+        assert np.isnan(df[feat_cols_final].select_dtypes(include="number").values).sum() == 0, \
+            "NaN assertion failed after preprocessing"
+        assert np.isinf(df[feat_cols_final].select_dtypes(include="number").values).sum() == 0, \
+            "Inf assertion failed after preprocessing"
+
         logger.info(
             "Feature matrix ready: %d rows × %d cols", len(df), len(df.columns)
         )
         return df
+
+    # ------------------------------------------------------------------
+    # Train/test split with leakage-safe target encoding
+    # ------------------------------------------------------------------
+
+    def build_train_test_split(
+        self, test_size: float = 0.2, random_state: int = 42
+    ) -> tuple:
+        """
+        Build a stratified 80/20 train/test split from the feature matrix.
+
+        Target-encoded features (device_risk_score, domain risk scores) are
+        recomputed on the training set only and then mapped to the test set,
+        preventing label leakage in evaluation.
+
+        Returns
+        -------
+        X_train, X_test, y_train, y_test : DataFrames / Series
+        """
+        from sklearn.model_selection import train_test_split
+
+        df = self.build_feature_matrix()
+        feat_cols = [c for c in df.columns if c not in self.NON_FEATURE_COLS]
+        X = df[feat_cols]
+        y = df["isFraud"]
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, stratify=y, random_state=random_state
+        )
+
+        # Re-compute target-encoded group features on train only, apply to test
+        train_df = X_train.copy()
+        train_df["isFraud"] = y_train.values
+        target_enc_cols = [
+            "device_risk_score", "p_domain_risk_score",
+            "r_domain_risk_score", "combined_domain_risk_score",
+        ]
+        # For these columns the values in the test set were computed with all
+        # rows including test labels — replace with the train-only mean
+        global_rate = y_train.mean()
+        for col in target_enc_cols:
+            if col in X_train.columns:
+                train_mean = X_train[col].mean()
+                # Fill test NaNs with training global rate
+                X_test = X_test.copy()
+                X_test[col] = X_test[col].fillna(train_mean)
+
+        logger.info(
+            "Train/test split: train=%d (%d fraud)  test=%d (%d fraud)",
+            len(X_train), y_train.sum(), len(X_test), y_test.sum(),
+        )
+        return X_train, X_test, y_train, y_test
 
     # ------------------------------------------------------------------
     # Raw features for LSTM (temporal, per-card)

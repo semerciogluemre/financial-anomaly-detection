@@ -4,6 +4,10 @@
 -- High-risk threshold: fraud_rate > 0.10 (10%).
 -- For domains seen fewer than 10 times we fall back to the global fraud rate
 -- to avoid noisy estimates from rare domains.
+--
+-- NOTE ON LEAKAGE: Same as 04_device_risk.sql — aggregates include the target
+-- transaction. Mitigated at the Python level via proper train/test split:
+-- domain risk scores are computed on training rows and mapped to the test set.
 -- =============================================================================
 
 WITH global_stats AS (
@@ -40,11 +44,9 @@ SELECT
     fc.P_emaildomain,
     fc.R_emaildomain,
 
-    -- ── Payer domain features ─────────────────────────────────────────────
     pds.p_domain_txn_count,
     pds.p_domain_fraud_rate,
 
-    -- Smoothed rate: use domain rate if ≥ 10 obs, else global fallback
     CASE
         WHEN pds.p_domain_txn_count >= 10 THEN pds.p_domain_fraud_rate
         ELSE gs.global_fraud_rate
@@ -57,7 +59,6 @@ SELECT
     CASE WHEN pds.p_domain_txn_count IS NULL THEN 1 ELSE 0 END
                                             AS p_domain_unknown_flag,
 
-    -- ── Recipient domain features ─────────────────────────────────────────
     rds.r_domain_txn_count,
     rds.r_domain_fraud_rate,
 
@@ -73,8 +74,6 @@ SELECT
     CASE WHEN rds.r_domain_txn_count IS NULL THEN 1 ELSE 0 END
                                             AS r_domain_unknown_flag,
 
-    -- ── Combined domain risk ──────────────────────────────────────────────
-    -- Max of payer and recipient risk scores
     MAX(
         COALESCE(
             CASE WHEN pds.p_domain_txn_count >= 10
