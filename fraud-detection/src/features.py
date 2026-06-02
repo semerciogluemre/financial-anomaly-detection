@@ -230,6 +230,54 @@ class FeatureEngineer:
         return df
 
     # ------------------------------------------------------------------
+    # Raw features for LSTM (temporal, per-card)
+    # ------------------------------------------------------------------
+
+    def load_raw_features(self) -> pd.DataFrame:
+        """
+        Load raw per-card transaction features directly from the DB.
+
+        These have genuine temporal structure within a card's history
+        (amounts change, C-counts accumulate, M-flags flip) — unlike the
+        engineered features which are already static aggregated risk scores.
+
+        Columns returned:
+            TransactionID, isFraud, TransactionDT, card1,
+            TransactionAmt, ProductCD (label-encoded),
+            C1–C14 (Vesta count features),
+            M1–M9  (Vesta match flags, label-encoded),
+            dist1, dist2, addr1, addr2
+
+        Returns
+        -------
+        pd.DataFrame  sorted by (card1, TransactionDT)
+        """
+        sql = """
+        SELECT
+            TransactionID, isFraud, TransactionDT, card1,
+            TransactionAmt,
+            ProductCD,
+            C1,  C2,  C3,  C4,  C5,  C6,  C7,
+            C8,  C9,  C10, C11, C12, C13, C14,
+            M1,  M2,  M3,  M4,  M5,  M6,  M7,  M8,  M9,
+            dist1, dist2, addr1, addr2
+        FROM transactions
+        ORDER BY card1, TransactionDT
+        """
+        df = self.run_query(sql)
+
+        # Encode categoricals
+        for col in ["ProductCD"] + [f"M{i}" for i in range(1, 10)]:
+            if col in df.columns:
+                df[col] = df[col].astype("category").cat.codes.astype("int16")
+
+        # Fill NaNs with 0 (most C/M nulls mean "not seen")
+        df = df.fillna(0)
+
+        logger.info("Raw features loaded: %d rows × %d cols", len(df), len(df.columns))
+        return df
+
+    # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 

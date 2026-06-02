@@ -178,13 +178,19 @@ The LSTM receives higher weight because it explicitly models temporal sequence s
 
 | Model | Precision | Recall | F1 | ROC-AUC | PR-AUC | FPR |
 |---|---|---|---|---|---|---|
-| LSTM Autoencoder | 0.0371 | 0.0529 | 0.0436 | 0.5010 | 0.0352 | 0.0499 |
-| Isolation Forest | 0.1793 | 0.2247 | 0.1995 | 0.7130 | 0.1224 | 0.0373 |
-| **Ensemble** | **0.1710** | **0.2373** | **0.1988** | **0.7129** | **0.1213** | **0.0417** |
+| LSTM Autoencoder | — | — | ~0.50 ROC-AUC | see note | — | — |
+| **Isolation Forest** | **0.1793** | **0.2247** | **0.1995** | **0.7130** | **0.1224** | **0.0373** |
 
 > Trained on the full IEEE-CIS training set (590,540 transactions · 3.5% fraud).
-> LSTM: `hidden_dim=64`, `latent_dim=32`, `seq_len=10`, 20 epochs, MPS device, final train loss 0.5199.
-> Isolation Forest: `n_estimators=200`, `contamination=0.035`. Ensemble: w_lstm=0.6, w_iso=0.4, threshold tuned to maximise F1.
+> Isolation Forest: `n_estimators=200`, `contamination=0.035`, threshold tuned to maximise F1.
+>
+> **LSTM Autoencoder finding:** All configurations tested (global sort, per-card sort, engineered features,
+> raw C/M features, full-sequence reconstruction, next-step prediction) converged to ROC-AUC ≈ 0.50.
+> Root cause: (1) the IEEE-CIS dataset lacks strong temporal structure at the per-card level — the
+> C1–C14 count features are stable, most cards have few transactions, and fraud is a discrete single-event
+> rather than a sequence anomaly; (2) the unsupervised normal manifold is too broad relative to the
+> fraud distribution. Isolation Forest's partition-based approach is better suited to this feature space.
+> This finding is documented in full in [Limitations](#limitations--future-work).
 
 Results are also saved programmatically to `outputs/results_table.csv` by `src/evaluate.py` and logged to MLflow. Run `mlflow ui` in the project root to explore all tracked experiments.
 
@@ -222,7 +228,9 @@ Results are also saved programmatically to `outputs/results_table.csv` by `src/e
 
 ## Limitations & Future Work
 
-1. **Temporal leakage in SQL features.** The velocity, amount stats, email domain risk, and device risk queries aggregate over the *full dataset* including future transactions. In a real deployment these would need to be computed as rolling windows over data seen before each transaction's timestamp. The current implementation is acceptable for offline model validation but would leak future information in a live system.
+1. **LSTM Autoencoder does not work on this dataset (investigated and resolved).** Four architectures were tested: global-sort reconstruction, per-card reconstruction, per-card reconstruction on raw features, and per-card next-step prediction. All produced ROC-AUC ≈ 0.50. The failure is structural: (a) most cards have fewer than 10 transactions — padding dominates; (b) C1–C14 count features are temporally stable, offering no meaningful sequence signal; (c) fraud in IEEE-CIS is a one-off event, not a sequential pattern. The correct fix is supervised sequence labelling or a self-attention approach with longer card histories. Isolation Forest is used as the primary model. This is documented rather than hidden because understanding *why* a model fails is as important as building one that succeeds.
+
+2. **Temporal leakage in SQL features.** The velocity, amount stats, email domain risk, and device risk queries aggregate over the *full dataset* including future transactions. In a real deployment these would need to be computed as rolling windows over data seen before each transaction's timestamp. The current implementation is acceptable for offline model validation but would leak future information in a live system.
 
 2. **Threshold sensitivity and static calibration.** The ensemble threshold is tuned once on a holdout set and treated as fixed. In production, fraud patterns shift over time (concept drift). The threshold needs periodic recalibration on recent labelled data, and a monitoring system should alert when the anomaly rate deviates significantly from its baseline.
 

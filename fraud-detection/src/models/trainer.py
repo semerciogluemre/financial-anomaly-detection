@@ -99,8 +99,18 @@ class ModelTrainer:
                 "Filtered to normal transactions: %d → %d rows", n_before, len(data)
             )
 
+        # ── Sort by card, then time so sequences stay within one card's history.
+        # Global-time sorting interleaves cards → sequences span different cards
+        # → the LSTM sees pure noise → ROC-AUC collapses to 0.50.
+        sort_cols = [c for c in ["card1", "TransactionDT"] if c in data.columns]
+        if sort_cols:
+            data = data.sort_values(sort_cols).reset_index(drop=True)
+            logger.info("Sorted by %s for per-card sequences.", sort_cols)
+
         # Drop non-numeric / identifier columns
         drop_cols = [c for c in ["TransactionID", "isFraud", "TransactionDT"] if c in data.columns]
+        # Keep card1 for boundary detection, drop after
+        card_col = data["card1"].values if "card1" in data.columns else None
         data = data.drop(columns=drop_cols)
 
         # Keep only requested feature cols that are present
@@ -111,7 +121,6 @@ class ModelTrainer:
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Standardise features — critical to prevent NaN loss in LSTM
-        # Fit scaler on this split; store it so score() can reuse it
         if train_on_normal or self._scaler is None:
             from sklearn.preprocessing import StandardScaler
             self._scaler = StandardScaler()
@@ -121,11 +130,46 @@ class ModelTrainer:
             X = self._scaler.transform(X)
             logger.info("Existing StandardScaler applied.")
 
-        # Sliding window
-        sequences = np.stack(
-            [X[i : i + seq_len] for i in range(len(X) - seq_len + 1)],
-            axis=0,
-        )  # (N - seq_len + 1, seq_len, n_features)
+        # ── Per-card sliding window ──────────────────────────────────────────
+        # Only create windows whose seq_len rows all belong to the same card.
+        # For cards with fewer than seq_len transactions we still emit one
+        # sequence by padding with the card's own mean (zero after scaling).
+        # self._seq_last_indices tracks the sorted-df row index of each
+        # sequence's LAST timestep — used for correct label alignment.
+        sequences         = []
+        last_row_indices  = []   # original sorted-df index of each seq's last step
+
+        if card_col is not None:
+            # Find card boundary indices
+            boundaries = np.where(np.diff(card_col) != 0)[0] + 1
+            boundaries = np.concatenate([[0], boundaries, [len(X)]])
+
+            for start, end in zip(boundaries[:-1], boundaries[1:]):
+                card_X = X[start:end]           # rows for this card
+                c_len  = len(card_X)
+
+                if c_len < seq_len:
+                    # Pad to seq_len by repeating last row
+                    pad    = np.tile(card_X[-1], (seq_len - c_len, 1))
+                    card_X = np.vstack([card_X, pad])
+                    sequences.append(card_X[:seq_len])
+                    last_row_indices.append(end - 1)   # last real row of this card
+                else:
+                    for i in range(c_len - seq_len + 1):
+                        sequences.append(card_X[i : i + seq_len])
+                        last_row_indices.append(start + i + seq_len - 1)  # last row of window
+
+            self._seq_last_indices = np.array(last_row_indices, dtype=np.int64)
+            logger.info(
+                "Per-card sequences: %d  (from %d cards)",
+                len(sequences), len(boundaries) - 1,
+            )
+        else:
+            # Fallback: global window (no card column available)
+            sequences = [X[i : i + seq_len] for i in range(len(X) - seq_len + 1)]
+            self._seq_last_indices = np.arange(seq_len - 1, len(X), dtype=np.int64)
+
+        sequences = np.stack(sequences, axis=0)
 
         logger.info(
             "Sequences shape: %s  (seq_len=%d, n_features=%d)",
@@ -151,7 +195,15 @@ class ModelTrainer:
         run_name: str = "lstm_autoencoder",
     ) -> LSTMAutoencoder:
         """
-        Train the LSTM autoencoder with Adam + MSE loss.
+        Train the LSTM in next-step prediction mode (seq2one).
+
+        Instead of reconstructing the full sequence (autoencoder), the model
+        takes the first seq_len-1 timesteps as input and predicts the LAST
+        timestep as output.
+
+        Anomaly signal: fraud transactions deviate from the card's predicted
+        next transaction — a much sharper signal than full-sequence
+        reconstruction error on the broad normal manifold.
 
         All hyperparameters and per-epoch losses are logged to MLflow.
 
@@ -172,7 +224,6 @@ class ModelTrainer:
         criterion = nn.MSELoss()
 
         with mlflow.start_run(run_name=run_name):
-            # Log hyperparameters
             mlflow.log_params({
                 "hidden_dim":          model.hidden_dim,
                 "latent_dim":          model.latent_dim,
@@ -182,7 +233,8 @@ class ModelTrainer:
                 "epochs":              epochs,
                 "lr":                  lr,
                 "optimizer":           "Adam",
-                "loss":                "MSELoss",
+                "loss":                "MSELoss_next_step",
+                "training_mode":       "next_step_prediction",
             })
 
             for epoch in range(1, epochs + 1):
@@ -191,16 +243,20 @@ class ModelTrainer:
                 n_batches = 0
 
                 for (batch,) in dataloader:
-                    batch = batch.to(self.device)
+                    batch   = batch.to(self.device)        # (B, seq_len, F)
+                    context = batch[:, :-1, :]             # first seq_len-1 steps
+                    target  = batch[:, -1, :]              # last step (current txn)
+
                     optimizer.zero_grad()
-                    recon = model(batch)
-                    loss = criterion(recon, batch)
+                    # Forward pass on context; use only the last decoder output
+                    recon   = model(context)               # (B, seq_len-1, F)
+                    pred    = recon[:, -1, :]              # predicted last step
+                    loss    = criterion(pred, target)
                     loss.backward()
-                    # Gradient clipping — important for LSTM stability
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     epoch_loss += loss.item()
-                    n_batches += 1
+                    n_batches  += 1
 
                 avg_loss = epoch_loss / max(n_batches, 1)
                 mlflow.log_metric("train_loss", avg_loss, step=epoch)
@@ -239,9 +295,13 @@ class ModelTrainer:
 
         with torch.no_grad():
             for (batch,) in dataloader:
-                batch = batch.to(self.device)
-                errors = model.reconstruction_error(batch)
-                all_errors.append(errors)
+                batch   = batch.to(self.device)
+                context = batch[:, :-1, :]          # first seq_len-1 steps
+                target  = batch[:, -1, :]           # actual last step
+                recon   = model(context)
+                pred    = recon[:, -1, :]           # predicted last step
+                mse     = ((target - pred) ** 2).mean(dim=1).cpu().numpy()
+                all_errors.append(mse)
 
         return np.concatenate(all_errors)
 

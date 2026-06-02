@@ -161,15 +161,24 @@ class LSTMAutoencoder(nn.Module):
         reconstruction = self.decoder(latent)
         return reconstruction
 
-    def reconstruction_error(self, x: Tensor) -> np.ndarray:
+    def reconstruction_error(self, x: Tensor, last_step_only: bool = True) -> np.ndarray:
         """
-        Compute per-sample mean squared reconstruction error.
+        Compute per-sample reconstruction error as the anomaly score.
 
-        This is the anomaly score: high error → anomalous sequence.
+        last_step_only=True (default):
+            MSE on the final timestep only — "how anomalous is THIS transaction
+            given the previous seq_len-1 transactions on this card?"
+            This is the correct signal: the model sees normal history and
+            tries to reconstruct the current event. Fraud = high last-step error.
+
+        last_step_only=False:
+            Mean MSE across all timesteps (original behaviour, weaker signal
+            because in-sequence normal steps dilute the fraud contribution).
 
         Parameters
         ----------
-        x : Tensor  (batch, seq_len, input_dim)  — can be on any device.
+        x              : Tensor  (batch, seq_len, input_dim)
+        last_step_only : bool    Default True.
 
         Returns
         -------
@@ -178,8 +187,11 @@ class LSTMAutoencoder(nn.Module):
         self.eval()
         with torch.no_grad():
             recon = self.forward(x)
-            # MSE averaged over (seq_len, input_dim) per sample
-            mse = ((x - recon) ** 2).mean(dim=(1, 2))  # (batch,)
+            if last_step_only:
+                # Error only on the final timestep (the "current" transaction)
+                mse = ((x[:, -1, :] - recon[:, -1, :]) ** 2).mean(dim=1)  # (batch,)
+            else:
+                mse = ((x - recon) ** 2).mean(dim=(1, 2))                   # (batch,)
         return mse.cpu().numpy()
 
     def encode(self, x: Tensor) -> Tensor:
