@@ -21,14 +21,24 @@ build/
 # MLflow
 mlruns/
 
-# Data files
-data/*.csv
-data/*.zip
-data/*.parquet
+# Data files — Kaggle competition files cannot be redistributed
+data/
+!data/.gitkeep
 
-# Database
+# Database & cached feature matrices
 db/*.db
 db/*.sqlite
+db/*.pkl
+
+# Trained model binaries — too large for GitHub; retrain with run_pipeline.py
+outputs/models/*.pkl
+outputs/models/*.pt
+
+# NumPy score arrays — regenerated on each run
+outputs/*.npy
+
+# MLflow tracking
+mlruns/
 
 # OS
 .DS_Store
