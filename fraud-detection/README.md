@@ -1,6 +1,13 @@
 # Financial Anomaly Detection
 
-> Unsupervised fraud detection on the IEEE-CIS dataset using an LSTM Autoencoder, Isolation Forest, and a weighted ensemble — with SQL feature engineering, SHAP explainability, MLflow experiment tracking, and a Streamlit dashboard.
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
+![XGBoost](https://img.shields.io/badge/XGBoost-supervised-189AB4)
+![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)
+![MLflow](https://img.shields.io/badge/MLflow-tracking-0194E2?logo=mlflow&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+> End-to-end fraud detection pipeline on the IEEE-CIS dataset: SQL feature engineering → XGBoost + Isolation Forest + MLP Autoencoder ensemble → SHAP explainability → Streamlit dashboard → MLflow experiment tracking.
 
 ---
 
@@ -105,7 +112,33 @@ The full pipeline spans raw CSV ingestion → SQL feature engineering → model 
 | **Fraud rate** | ~3.5% (highly imbalanced) |
 | **Target column** | `isFraud` (0 = normal, 1 = fraud) |
 
-The dataset is not included in this repository due to Kaggle's terms of service. Download it manually and place the four CSV files in `fraud-detection/data/` before running ingestion.
+### Downloading the Data
+
+The data files are **not included** in this repository — they are subject to Kaggle's competition terms of service and cannot be redistributed.
+
+**Steps to download:**
+
+1. Create a free account at [kaggle.com](https://www.kaggle.com)
+2. Accept the competition rules at [https://www.kaggle.com/competitions/ieee-fraud-detection/data](https://www.kaggle.com/competitions/ieee-fraud-detection/data)
+3. Download these four files:
+   ```
+   train_transaction.csv   (~652 MB)
+   train_identity.csv      (~25 MB)
+   test_transaction.csv    (~585 MB)
+   test_identity.csv       (~25 MB)
+   ```
+4. Place them in `fraud-detection/data/`:
+   ```
+   fraud-detection/
+   └── data/
+       ├── train_transaction.csv
+       ├── train_identity.csv
+       ├── test_transaction.csv
+       └── test_identity.csv
+   ```
+5. Run ingestion: `python -m src.run_pipeline --skip-training`
+
+> `data/` is listed in `.gitignore` — the CSV files will never be accidentally committed.
 
 Class imbalance (~96.5% normal / ~3.5% fraud) is a key challenge. It motivates the unsupervised approach: rather than training a classifier on a severely skewed label distribution, we train the autoencoder on normal transactions only and treat high reconstruction error as a proxy for anomaly.
 
@@ -312,58 +345,31 @@ df = fe.build_feature_matrix()
 fe.get_feature_summary(df)
 ```
 
-### 6. Train the models
+### 6. Run the full pipeline (recommended)
 
-```python
-from src.models.lstm_ae import LSTMAutoencoder
-from src.models.trainer import ModelTrainer
-from src.models.iso_forest import IsolationForestModel
-from src.ensemble import EnsembleScorer
+The single-command pipeline runner handles everything: training, evaluation, explainability, and results.
 
-feature_cols = [c for c in df.columns
-                if c not in {"TransactionID", "isFraud", "TransactionDT"}]
+```bash
+# Train all models from scratch:
+python -m src.run_pipeline --data-dir data/ --output-dir outputs/
 
-# LSTM Autoencoder
-trainer  = ModelTrainer(feature_cols=feature_cols)
-dl_train = trainer.prepare_sequences(df, seq_len=10, train_on_normal=True)
-model    = LSTMAutoencoder(input_dim=len(feature_cols), hidden_dim=128,
-                           latent_dim=32, seq_len=10)
-model    = trainer.train(model, dl_train, epochs=20, lr=1e-3)
-errors   = trainer.score(model, dl_train)
-threshold_lstm = trainer.find_threshold(errors, percentile=95)
+# Skip ingestion (DB already populated):
+python -m src.run_pipeline --skip-ingestion
 
-# Isolation Forest
-iso = IsolationForestModel(n_estimators=200, contamination="auto")
-iso.fit(df)
-iso_scores = iso.score(df)
-
-# Ensemble
-ensemble = EnsembleScorer(weight_lstm=0.6, weight_iso=0.4)
-combined, preds = ensemble.run(errors, iso_scores[:len(errors)], labels=df["isFraud"].values[:len(errors)])
+# Fast re-run using saved model checkpoints:
+python -m src.run_pipeline --skip-ingestion --skip-training
 ```
 
-### 7. Evaluate and explain
+Each step prints `[N/7] Step name ... ✓ Done in Xs`. Errors are caught per-step and logged without crashing the whole run.
 
-```python
-from src.evaluate import Evaluator
-from src.explainability import Explainer
-
-ev = Evaluator(output_dir="outputs/")
-ev.error_distribution(errors, df["isFraud"].values[:len(errors)])
-ev.precision_recall_curve(labels, {"LSTM": errors, "IsolationForest": iso_scores[:len(errors)], "Ensemble": combined})
-
-ex = Explainer(output_dir="outputs/")
-ex.shap_isolation_forest(iso, df, n_samples=500)
-```
-
-### 8. Launch MLflow UI
+### 7. Launch MLflow UI
 
 ```bash
 mlflow ui --backend-store-uri mlruns/
 # Open http://localhost:5000
 ```
 
-### 9. Launch Streamlit dashboard
+### 8. Launch Streamlit dashboard
 
 ```bash
 streamlit run dashboard/app.py
