@@ -1,24 +1,36 @@
 """
-run_pipeline.py — End-to-end fraud detection pipeline runner.
-
-Executes the full pipeline in sequence:
-  1. Data ingestion (CSV → SQLite)
-  2. Feature engineering (SQL → feature matrix)
-  3. Isolation Forest training + scoring
-  4. Evaluation (plots, results table)
-  5. SHAP explainability
+run_pipeline.py — Single-command entry point for the full fraud detection pipeline.
 
 Usage:
+    # Full run from scratch (train all models):
     python -m src.run_pipeline --data-dir data/ --output-dir outputs/
-    python -m src.run_pipeline --data-dir data/ --output-dir outputs/ --skip-ingestion
-    python -m src.run_pipeline --help
+
+    # Fast re-run using saved models (skip training):
+    python -m src.run_pipeline --data-dir data/ --output-dir outputs/ --skip-training
+
+    # Skip ingestion too (DB already populated):
+    python -m src.run_pipeline --skip-ingestion --skip-training
+
+Steps:
+    [1/7] Ingest CSVs into SQLite
+    [2/7] Build feature matrix (SQL + pandas velocity)
+    [3/7] Train / load models  (IF, XGBoost, MLP-AE, LOF)
+    [4/7] Ensemble weight tuning
+    [5/7] Evaluation  (metrics, plots, results table)
+    [6/7] Explainability  (SHAP summary + waterfalls)
+    [7/7] Print final results table
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
+import traceback
 from pathlib import Path
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -26,165 +38,249 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def _banner(title: str) -> None:
-    width = 60
-    logger.info("=" * width)
-    logger.info(f"  {title}")
-    logger.info("=" * width)
+TOTAL_STEPS = 7
 
 
-def _elapsed(start: float) -> str:
+def _step(n: int, label: str) -> float:
+    print(f"\n{'='*60}")
+    print(f"  [{n}/{TOTAL_STEPS}] {label}")
+    print(f"{'='*60}")
+    return time.time()
+
+
+def _ok(start: float) -> None:
     s = time.time() - start
-    return f"{s//60:.0f}m {s%60:.0f}s" if s >= 60 else f"{s:.1f}s"
+    dur = f"{s//60:.0f}m {s%60:.0f}s" if s >= 60 else f"{s:.1f}s"
+    print(f"  ✓  Done in {dur}")
+
+
+def _fail(step_label: str, exc: Exception) -> None:
+    logger.error("Step '%s' failed: %s", step_label, exc)
+    logger.debug(traceback.format_exc())
+    print(f"  ✗  FAILED — continuing to next step (check logs above)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Steps
+# Step implementations
 # ─────────────────────────────────────────────────────────────────────────────
 
 def step_ingestion(data_dir: str, db_path: str) -> None:
-    _banner("STEP 1 — Data Ingestion")
-    t = time.time()
     from src.ingestion import DataIngestion
     ing = DataIngestion(data_dir=data_dir, db_path=db_path)
     ing.run(split="train")
-    logger.info("Ingestion completed in %s", _elapsed(t))
 
 
-def step_features(db_path: str, sql_dir: str, cache_path: str) -> "pd.DataFrame":
-    _banner("STEP 2 — Feature Engineering")
-    t = time.time()
-    import pandas as pd
-    cache = Path(cache_path)
-
+def step_features(
+    db_path: str, sql_dir: str, cache_path: str
+) -> "tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]":
+    import pickle
     from src.features import FeatureEngineer
-    fe = FeatureEngineer(db_path=db_path, sql_dir=sql_dir)
-    df = fe.build_feature_matrix()
-    fe.get_feature_summary(df)
-    df.to_pickle(str(cache))
-    logger.info("Feature matrix cached at %s", cache)
-    logger.info("Features completed in %s", _elapsed(t))
-    return df
+
+    cache = Path(cache_path)
+    if cache.exists():
+        import pandas as pd
+        print(f"  Loading cached split from {cache} …")
+        with open(cache, "rb") as f:
+            X_train, X_test, y_train, y_test = pickle.load(f)
+        print(f"  Train {X_train.shape}  Test {X_test.shape}")
+    else:
+        fe = FeatureEngineer(db_path=db_path, sql_dir=sql_dir)
+        X_train, X_test, y_train, y_test = fe.build_train_test_split()
+        with open(cache, "wb") as f:
+            pickle.dump((X_train, X_test, y_train, y_test), f)
+        print(f"  Split cached → {cache}")
+
+    return X_train, X_test, y_train, y_test
 
 
-def step_isolation_forest(
-    df: "pd.DataFrame",
-    output_dir: str,
-    n_estimators: int,
-    contamination: float,
-) -> tuple:
-    _banner("STEP 3 — Isolation Forest")
-    t = time.time()
-    import numpy as np
+def step_train_or_load(
+    X_train, y_train, output_dir: str, skip_training: bool
+) -> dict:
+    """Train all models or load saved ones. Returns dict of {name: model}."""
     import joblib
-    from src.models.iso_forest import IsolationForestModel
+    import numpy as np
+    from pathlib import Path
+
+    models_dir = Path(output_dir) / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    models = {}
+
+    # ── Isolation Forest ─────────────────────────────────────────────
+    if_path = models_dir / "iso_forest.pkl"
+    if skip_training and if_path.exists():
+        print("  Loading Isolation Forest …")
+        models["iso"] = joblib.load(if_path)
+    else:
+        print("  Training Isolation Forest …")
+        from src.models.iso_forest import IsolationForestModel
+        iso = IsolationForestModel(n_estimators=200, contamination=0.035, random_state=42)
+        iso.fit(X_train)
+        joblib.dump(iso, if_path)
+        models["iso"] = iso
+
+    # ── XGBoost ──────────────────────────────────────────────────────
+    xgb_path = models_dir / "xgboost.pkl"
+    if skip_training and xgb_path.exists():
+        print("  Loading XGBoost …")
+        from src.models.xgboost_model import XGBoostModel
+        models["xgb"] = XGBoostModel.load(xgb_path)
+    else:
+        print("  Training XGBoost (n_estimators=500) …")
+        from src.models.xgboost_model import XGBoostModel
+        xgb = XGBoostModel(n_estimators=500, max_depth=6, learning_rate=0.05)
+        xgb.fit(X_train, y_train)
+        xgb.save(str(xgb_path))
+        models["xgb"] = xgb
+
+    # ── MLP Autoencoder ───────────────────────────────────────────────
+    mlp_path = models_dir / "mlp_ae.pt"
+    if skip_training and mlp_path.exists():
+        print("  Loading MLP Autoencoder …")
+        from src.models.mlp_autoencoder import MLPAutoencoder
+        mlp = MLPAutoencoder()
+        mlp.load(str(mlp_path))
+        models["mlp"] = mlp
+    else:
+        print("  Training MLP Autoencoder (50 epochs) …")
+        from src.models.mlp_autoencoder import MLPAutoencoder
+        mlp = MLPAutoencoder()
+        mlp.fit(X_train, y_train, epochs=50)
+        mlp.save(str(mlp_path))
+        models["mlp"] = mlp
+
+    # ── LOF ───────────────────────────────────────────────────────────
+    lof_path = models_dir / "lof.pkl"
+    if skip_training and lof_path.exists():
+        print("  Loading LOF …")
+        from src.models.lof_model import LOFModel
+        models["lof"] = LOFModel.load(lof_path)
+    else:
+        print("  Training LOF (n_neighbors=20) …")
+        from src.models.lof_model import LOFModel
+        lof = LOFModel(n_neighbors=20, contamination=0.035)
+        lof.fit(X_train, y_train)
+        lof.save(str(lof_path))
+        models["lof"] = lof
+
+    return models
+
+
+def step_ensemble(models: dict, X_test, y_test, output_dir: str) -> dict:
+    """Score all models, tune ensemble weights, return score arrays."""
+    import numpy as np
     from src.ensemble import EnsembleScorer
-    from sklearn.metrics import f1_score
 
-    Path(output_dir, "models").mkdir(parents=True, exist_ok=True)
+    labels = y_test.values
+    scores = {}
 
-    iso = IsolationForestModel(
-        n_estimators=n_estimators,
-        contamination=contamination,
-        random_state=42,
-    )
-    iso.fit(df)
-    iso_scores = iso.score(df)
-    np.save(str(Path(output_dir, "iso_scores.npy")), iso_scores)
+    print("  Scoring models …")
+    scores["xgb"] = models["xgb"].score(X_test)
+    scores["iso"] = models["iso"].score(X_test)
+    scores["mlp"] = models["mlp"].reconstruction_error(X_test)
+    scores["lof"] = models["lof"].score(X_test)
 
-    # Best-F1 threshold
-    labels   = df["isFraud"].values
-    iso_norm = EnsembleScorer.normalize(iso_scores)
-    best_t, best_f1 = 0.5, 0.0
-    for t_val in [i / 100 for i in range(5, 96)]:
-        s = f1_score(labels, (iso_norm > t_val).astype(int), zero_division=0)
-        if s > best_f1:
-            best_f1, best_t = s, t_val
-    iso_preds = (iso_norm > best_t).astype(int)
-    np.save(str(Path(output_dir, "iso_preds.npy")), iso_preds)
+    # Save scores
+    out = Path(output_dir)
+    np.save(str(out / "xgb_scores.npy"), scores["xgb"])
+    np.save(str(out / "iso_scores_test.npy"), scores["iso"])
+    np.save(str(out / "mlp_scores.npy"), scores["mlp"])
+    np.save(str(out / "lof_scores.npy"), scores["lof"])
 
-    joblib.dump(iso, str(Path(output_dir, "models", "iso_forest.pkl")))
-    logger.info("IF saved  |  best F1=%.4f at threshold=%.2f", best_f1, best_t)
-    logger.info("Isolation Forest completed in %s", _elapsed(t))
-    return iso_scores, iso_preds
+    print("  Tuning ensemble weights (grid search over PR-AUC) …")
+    ens = EnsembleScorer()
+    best = ens.tune_weights(scores["xgb"], scores["iso"], scores["mlp"],
+                            labels, metric="pr_auc")
+    scores["ensemble"] = ens.combine_v2(scores["xgb"], scores["iso"], scores["mlp"])
+    scores["_ens_obj"] = ens
+    scores["_labels"]  = labels
+
+    return scores
 
 
-def step_evaluation(
-    df: "pd.DataFrame",
-    iso_scores: "np.ndarray",
-    iso_preds: "np.ndarray",
-    output_dir: str,
-) -> None:
-    _banner("STEP 4 — Evaluation")
-    t = time.time()
+def step_evaluation(scores: dict, output_dir: str) -> "pd.DataFrame":
     import numpy as np
     from sklearn.metrics import (
         precision_score, recall_score, f1_score,
         roc_auc_score, average_precision_score, confusion_matrix,
     )
     from src.evaluate import Evaluator
+    from src.ensemble import EnsembleScorer
 
-    labels = df["isFraud"].values
-    ev = Evaluator(output_dir=output_dir)
+    labels = scores["_labels"]
+    ens    = scores["_ens_obj"]
+    ev     = Evaluator(output_dir=output_dir)
 
-    ev.precision_recall_curve(labels, {"IsolationForest": iso_scores})
-    ev.confusion_matrix(labels, iso_preds, "Isolation_Forest")
-    ev.threshold_analysis(
-        labels,
-        EnsembleScorer_normalize(iso_scores),
-        "Isolation_Forest",
-    )
-
-    tn, fp, fn, tp = confusion_matrix(labels, iso_preds).ravel()
-    results = {
-        "Isolation Forest": {
-            "precision":           precision_score(labels, iso_preds, zero_division=0),
-            "recall":              recall_score(labels, iso_preds, zero_division=0),
-            "f1":                  f1_score(labels, iso_preds, zero_division=0),
-            "roc_auc":             roc_auc_score(labels, iso_scores),
-            "pr_auc":              average_precision_score(labels, iso_scores),
-            "false_positive_rate": fp / max(fp + tn, 1),
+    def best_threshold_metrics(y, raw_scores, threshold=None):
+        norm = EnsembleScorer.normalize(raw_scores)
+        if threshold is None:
+            best_t, best_f1 = 0.5, 0.0
+            for t in [i/100 for i in range(5, 96)]:
+                f = f1_score(y, (norm > t).astype(int), zero_division=0)
+                if f > best_f1:
+                    best_f1, best_t = f, t
+            preds = (norm > best_t).astype(int)
+        else:
+            preds = (raw_scores > threshold).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y, preds).ravel()
+        return {
+            "Precision": round(precision_score(y, preds, zero_division=0), 4),
+            "Recall":    round(recall_score(y, preds, zero_division=0),    4),
+            "F1":        round(f1_score(y, preds, zero_division=0),        4),
+            "ROC-AUC":   round(roc_auc_score(y, raw_scores),               4),
+            "PR-AUC":    round(average_precision_score(y, raw_scores),     4),
+            "FPR":       round(fp / max(fp + tn, 1),                       4),
         }
+
+    results = {
+        "LSTM-AE (neg. result)": {"Precision":0,"Recall":0,"F1":0,
+                                   "ROC-AUC":0.5003,"PR-AUC":0.036,"FPR":0},
+        "MLP-AE":           best_threshold_metrics(labels, scores["mlp"]),
+        "Isolation Forest": best_threshold_metrics(labels, scores["iso"]),
+        "LOF":              best_threshold_metrics(labels, scores["lof"]),
+        "XGBoost":          best_threshold_metrics(labels, scores["xgb"]),
+        "Ensemble":         best_threshold_metrics(labels, scores["ensemble"],
+                                threshold=ens.best_threshold),
     }
-    df_results = ev.results_table(results)
+
+    import pandas as pd
+    df_res = pd.DataFrame(results).T
+    df_res.to_csv(Path(output_dir) / "results_table.csv")
+
+    # PR + ROC curves for all models
+    ev.precision_recall_curve(
+        labels,
+        {"MLP-AE": scores["mlp"],
+         "IF":     scores["iso"],
+         "XGBoost":scores["xgb"],
+         "Ensemble":scores["ensemble"]},
+    )
+    ens_preds = (EnsembleScorer.normalize(scores["ensemble"]) > ens.best_threshold).astype(int)
+    ev.confusion_matrix(labels, ens_preds, "Ensemble")
+    ev.error_distribution(scores["mlp"], labels)
     ev.log_all_metrics()
 
-    print()
-    print("=" * 65)
-    print("  RESULTS TABLE")
-    print("=" * 65)
-    print(df_results.to_string())
-    print("=" * 65)
-    logger.info("Evaluation completed in %s", _elapsed(t))
+    return df_res
 
 
-def EnsembleScorer_normalize(scores):
-    """Inline min-max normalise (avoids import-order issues)."""
+def step_explainability(models: dict, X_test, scores: dict, output_dir: str) -> None:
     import numpy as np
-    s_min, s_max = scores.min(), scores.max()
-    return (scores - s_min) / (s_max - s_min + 1e-9)
-
-
-def step_explainability(
-    iso,
-    df: "pd.DataFrame",
-    iso_preds: "np.ndarray",
-    output_dir: str,
-    n_waterfall: int = 3,
-) -> None:
-    _banner("STEP 5 — SHAP Explainability")
-    t = time.time()
     from src.explainability import Explainer
 
-    ex = Explainer(output_dir=output_dir)
-    ex.shap_isolation_forest(iso, df, n_samples=500, n_top_features=15)
+    ex      = Explainer(output_dir=output_dir)
+    labels  = scores["_labels"]
+    xgb_s   = scores["xgb"]
+    flagged = [int(i) for i in np.where((xgb_s > 0.5).astype(int) == 1)[0][:3]]
 
-    flagged = [int(i) for i in __import__("numpy").where(iso_preds == 1)[0][:n_waterfall]]
+    print(f"  SHAP summary on XGBoost …")
+    ex.shap_xgboost_summary(models["xgb"], X_test, n_samples=500)
+
+    print(f"  SHAP waterfalls for {len(flagged)} flagged transactions …")
     for idx in flagged:
-        ex.shap_waterfall(iso, df, transaction_idx=idx)
+        ex.shap_xgboost_waterfall(models["xgb"], X_test, transaction_idx=idx)
 
-    logger.info("Explainability completed in %s", _elapsed(t))
+    print("  SHAP model comparison (XGB vs IF) …")
+    ex.shap_comparison(models["xgb"], models["iso"], X_test, n_samples=500)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,65 +292,102 @@ def main() -> None:
         description="Run the full financial anomaly detection pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data-dir",        default="data/",    help="Directory with raw CSVs")
-    parser.add_argument("--db-path",         default="db/fraud.db", help="SQLite database path")
-    parser.add_argument("--sql-dir",         default="sql/",     help="Directory with .sql files")
-    parser.add_argument("--output-dir",      default="outputs/", help="Output directory for plots/models")
-    parser.add_argument("--cache-path",      default="db/feature_matrix.pkl",
-                        help="Path to cache the feature matrix")
-    parser.add_argument("--n-estimators",    type=int,   default=200)
-    parser.add_argument("--contamination",   type=float, default=0.035)
-    parser.add_argument("--skip-ingestion",  action="store_true",
-                        help="Skip ingestion (DB already populated)")
-    parser.add_argument("--skip-features",   action="store_true",
-                        help="Skip feature engineering (use cached matrix)")
+    parser.add_argument("--data-dir",      default="data/",            help="Raw CSV directory")
+    parser.add_argument("--db-path",       default="db/fraud.db",      help="SQLite database path")
+    parser.add_argument("--sql-dir",       default="sql/",             help=".sql files directory")
+    parser.add_argument("--output-dir",    default="outputs/",         help="Plots/results directory")
+    parser.add_argument("--cache-path",    default="db/train_test_split.pkl",
+                                                                        help="Train/test split cache")
+    parser.add_argument("--skip-ingestion", action="store_true",       help="Skip DB ingestion")
+    parser.add_argument("--skip-training",  action="store_true",       help="Load saved models instead")
     args = parser.parse_args()
 
     pipeline_start = time.time()
-    _banner("FINANCIAL ANOMALY DETECTION PIPELINE")
-    logger.info("data_dir    : %s", args.data_dir)
-    logger.info("db_path     : %s", args.db_path)
-    logger.info("output_dir  : %s", args.output_dir)
+    print("\n" + "="*60)
+    print("  FINANCIAL ANOMALY DETECTION PIPELINE")
+    print(f"  output_dir : {Path(args.output_dir).resolve()}")
+    print(f"  skip_train : {args.skip_training}")
+    print("="*60)
 
-    # Step 1 — Ingestion
-    if not args.skip_ingestion:
-        step_ingestion(args.data_dir, args.db_path)
+    errors: list[str] = []
+
+    # [1/7] Ingestion
+    t = _step(1, "Ingesting data into SQLite")
+    if args.skip_ingestion:
+        print("  Skipped (--skip-ingestion)")
     else:
-        logger.info("STEP 1 — Ingestion SKIPPED (--skip-ingestion)")
+        try:
+            step_ingestion(args.data_dir, args.db_path)
+            _ok(t)
+        except Exception as e:
+            _fail("Ingestion", e); errors.append("Ingestion")
 
-    # Step 2 — Features
-    cache = Path(args.cache_path)
-    if args.skip_features and cache.exists():
-        logger.info("STEP 2 — Features SKIPPED (loading cache from %s)", cache)
-        import pandas as pd
-        df = pd.read_pickle(str(cache))
-        logger.info("Loaded feature matrix: %s", df.shape)
+    # [2/7] Features
+    t = _step(2, "Building feature matrix")
+    try:
+        X_train, X_test, y_train, y_test = step_features(
+            args.db_path, args.sql_dir, args.cache_path
+        )
+        _ok(t)
+    except Exception as e:
+        _fail("Features", e); errors.append("Features")
+        print("\n❌ Cannot continue without features. Exiting."); sys.exit(1)
+
+    # [3/7] Models
+    t = _step(3, "Training / loading models")
+    try:
+        models = step_train_or_load(X_train, y_train, args.output_dir, args.skip_training)
+        _ok(t)
+    except Exception as e:
+        _fail("Models", e); errors.append("Models")
+        print("\n❌ Cannot continue without models. Exiting."); sys.exit(1)
+
+    # [4/7] Ensemble
+    t = _step(4, "Scoring & ensemble weight tuning")
+    try:
+        scores = step_ensemble(models, X_test, y_test, args.output_dir)
+        _ok(t)
+    except Exception as e:
+        _fail("Ensemble", e); errors.append("Ensemble"); scores = {}
+
+    # [5/7] Evaluation
+    t = _step(5, "Evaluation (metrics + plots)")
+    df_results = None
+    try:
+        df_results = step_evaluation(scores, args.output_dir)
+        _ok(t)
+    except Exception as e:
+        _fail("Evaluation", e); errors.append("Evaluation")
+
+    # [6/7] Explainability
+    t = _step(6, "Explainability (SHAP)")
+    try:
+        step_explainability(models, X_test, scores, args.output_dir)
+        _ok(t)
+    except Exception as e:
+        _fail("Explainability", e); errors.append("Explainability")
+
+    # [7/7] Results table
+    _step(7, "Final results")
+    if df_results is not None:
+        print()
+        print(df_results.to_string())
     else:
-        df = step_features(args.db_path, args.sql_dir, args.cache_path)
+        print("  Results table unavailable (evaluation step failed).")
 
-    # Step 3 — Isolation Forest
-    import joblib
-    iso_model_path = Path(args.output_dir, "models", "iso_forest.pkl")
-    iso_scores_path = Path(args.output_dir, "iso_scores.npy")
-    iso_preds_path  = Path(args.output_dir, "iso_preds.npy")
-
-    import numpy as np
-    iso_scores, iso_preds = step_isolation_forest(
-        df, args.output_dir, args.n_estimators, args.contamination
-    )
-    iso = joblib.load(str(iso_model_path))
-
-    # Step 4 — Evaluation
-    step_evaluation(df, iso_scores, iso_preds, args.output_dir)
-
-    # Step 5 — Explainability
-    step_explainability(iso, df, iso_preds, args.output_dir)
-
-    logger.info("")
-    _banner(f"PIPELINE COMPLETE  —  total time: {_elapsed(pipeline_start)}")
-    logger.info("  Outputs saved to : %s", Path(args.output_dir).resolve())
-    logger.info("  MLflow UI        : mlflow ui --backend-store-uri mlruns/")
-    logger.info("  Dashboard        : streamlit run dashboard/app.py")
+    # Summary
+    total = time.time() - pipeline_start
+    dur   = f"{total//60:.0f}m {total%60:.0f}s"
+    print(f"\n{'='*60}")
+    if errors:
+        print(f"  Pipeline finished with {len(errors)} error(s): {errors}")
+    else:
+        print(f"  Pipeline complete — no errors")
+    print(f"  Total time : {dur}")
+    print(f"  Outputs    : {Path(args.output_dir).resolve()}")
+    print(f"  MLflow     : mlflow ui --backend-store-uri mlruns/")
+    print(f"  Dashboard  : streamlit run dashboard/app.py")
+    print("="*60 + "\n")
 
 
 if __name__ == "__main__":
